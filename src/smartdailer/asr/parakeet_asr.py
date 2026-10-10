@@ -21,6 +21,9 @@ class ParakeetASR(ASRBase):
             import nemo.collections.asr as nemo_asr
             import torch
 
+            # Avoid Windows cuDNN DLL version conflict with ctranslate2
+            torch.backends.cudnn.enabled = False
+
             # Load pretrained model from NeMo / HuggingFace cache
             self.model = nemo_asr.models.ASRModel.from_pretrained(model_name=self.config.model_name)
 
