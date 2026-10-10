@@ -21,3 +21,12 @@ outputs/*.wav
 .env
 .vscode/
 .idea/
+
+# LaTeX auxiliary files
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+

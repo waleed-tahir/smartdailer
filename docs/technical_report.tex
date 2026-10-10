@@ -1,0 +1,797 @@
+\documentclass[11pt,a4paper,titlepage]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+
+% Hyperlink configuration
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=blue!70!black,
+    urlcolor=blue!80!black,
+    pdfauthor={SmartDialer Engineering Team},
+    pdftitle={SmartDialer: Technical Implementation and Knowledge Transfer Report}
+}
+
+% Code listing configuration
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.97,0.97,0.97}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2,
+    frame=lines
+}
+\lstset{style=mystyle}
+
+% Page headers and footers
+\pagestyle{fancy}
+\setlength{\headheight}{14pt}
+\fancyhf{}
+\fancyhead[L]{\slshape SmartDialer Technical Implementation Report}
+\fancyhead[R]{\thepage}
+\fancyfoot[C]{\footnotesize SmartDialer Core Architecture \& Knowledge Transfer Report}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0.4pt}
+
+\title{
+    \vspace{-2cm}
+    \Huge \textbf{SmartDialer: Real-Time Dual-Agent Voice Pipeline, Sliding-Window Chunked ASR, and WebRTC Telephony}\\
+    \vspace{0.8cm}
+    \LARGE \textbf{Full Technical Implementation and Knowledge Transfer Report}\\
+    \vspace{0.5cm}
+    \large An Exhaustive Guide to Sliding-Window Audio Buffering, Faster-Whisper, NVIDIA Parakeet CTC, and LiveKit WebRTC Migration
+}
+
+\author{
+    \textbf{SmartDialer Engineering Team} \\
+    Waleed Tahir \and AI Systems Architecture Group\\
+    \texttt{https://github.com/waleed-tahir/smartdailer}
+}
+
+\date{\today \quad | \quad Version 1.0.0-PROD}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides an exhaustive, production-grade technical implementation and knowledge transfer report for the \textbf{SmartDialer} platform. The platform is an autonomous, ultra-low-latency dual-agent voice system capable of orchestrating human-like dialogues between autonomous agents or between an automated dialer and a human telephone subscriber. We present the mathematical formulation and software engineering behind a 2.5-second streaming sliding window with a 0.5-second overlap ($T_w = 2.5\text{s}, T_o = 0.5\text{s}, T_s = 2.0\text{s}$) that completely eliminates boundary truncation artifacts while maintaining sub-second conversational responsiveness.
+
+Furthermore, we document the comparative implementation of two distinct state-of-the-art Automatic Speech Recognition (ASR) backends: CTranslate2-accelerated Faster-Whisper running in FP16 precision on an NVIDIA GeForce RTX 3060 Laptop GPU, and the NVIDIA NeMo 3.0 Conformer-CTC Parakeet architecture (\texttt{nvidia/parakeet-ctc-0.6b}). We analyze speech synthesis implementations (direct Windows SAPI5 non-blocking COM streams and asynchronous Edge-TTS), multi-agent dialogue turn-taking state machines, transcript deduplication mechanics, and the end-to-end porting of this system to the LiveKit WebRTC and SIP telephony infrastructure. Comprehensive post-mortems of system-level issues---including Windows CUDA dynamic link library (DLL) binding, COM apartment thread synchronization, CP1252 terminal encoding anomalies, and cuDNN shared-library symbol discrepancies---are documented in detail to serve as an authoritative operational guide for incoming engineering personnel.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\chapter{Executive Summary and Project Architecture}
+
+\section{Introduction and Problem Statement}
+Real-time conversational voice systems represent one of the most challenging frontiers in modern applied artificial intelligence. Unlike text-based conversational interfaces where network latency of several seconds is tolerable, conversational voice agents operate within rigid psychoacoustic constraints. Human dialogue exhibits an average inter-turn latency of approximately 200 to 400 milliseconds. When an artificial conversational agent introduces latencies exceeding 700 to 1,000 milliseconds, conversational flow degrades, inducing hesitation, false barge-ins, and user frustration.
+
+Traditional Automatic Speech Recognition (ASR) systems present an architectural dilemma:
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Full-Utterance Batch ASR}: The system employs Voice Activity Detection (VAD) to await the complete cessation of user speech (typically requiring 500--800 ms of trailing silence) before passing the accumulated audio buffer to an acoustic model (such as OpenAI Whisper). While transcription accuracy is maximized because the model observes the full acoustic and linguistic context, the resulting latency is catastrophic ($>1.5$--$2.5$ seconds post-speech).
+    \item \textbf{Instantaneous Frame-by-Frame Streaming ASR}: Acoustic models evaluate tiny audio slices (e.g., 20--80 ms). While streaming latency is minimal, models suffer from severe word error rates (WER), linguistic hallucinations, and lack of context, often requiring heavy language-model rescoring pipelines.
+\end{enumerate}
+
+The SmartDialer platform solves this fundamental trade-off through a \textbf{sliding-window chunked transcription pipeline}. By continuously buffering incoming speech into a 2.5-second sliding window with a 0.5-second overlap ($T_w=2.5\text{s}$, $T_o=0.5\text{s}$), the acoustic model receives sufficient phonetic context to achieve optimal transcription accuracy, while delivering transcript updates every 2.0 seconds in real time.
+
+\section{Core System Requirements}
+The design objectives mandated for the SmartDialer codebase comprise:
+\begin{itemize}
+    \item \textbf{Dual-Engine ASR Agility}: The platform must natively support both Faster-Whisper (OpenAI Whisper architecture accelerated via CTranslate2 in FP16/INT8) and NVIDIA Parakeet (NeMo Conformer CTC), with single-flag runtime hot-swapping.
+    \item \textbf{Autonomous Multi-Agent Dialogue Loop}: The system must orchestrate two distinct autonomous voice agents capable of conversing over real audio streams in real time (e.g., an outbound dialer agent and an inbound prospective client).
+    \item \textbf{Acoustic Boundary Reconciliation}: Overlapping boundaries between adjacent chunks ($0.5\text{s}$) must be automatically reconciled, deduplicated, and stitched without duplicating tokens or dropping truncated words.
+    \item \textbf{Real-Time Physical Audio Output}: Speech synthesized during agent turns must stream simultaneously to local audio transducers (soundcard speakers) and downstream listener ASR buffers at authentic 1.0x wall-clock velocity.
+    \item \textbf{WebRTC and SIP Telephony Portability}: The architecture must seamlessly translate from standalone local memory buffers into LiveKit WebRTC rooms and SIP phone trunks.
+\end{itemize}
+
+\section{High-Level Architectural Topology}
+The platform is decoupled into five modular subsystems:
+\begin{enumerate}
+    \item \textbf{Audio Layer} (\texttt{smartdailer.audio}): Manages PCM normalization, resampling, WAV I/O, and the sliding-window \texttt{AudioChunkBuffer}.
+    \item \textbf{ASR Subsystem} (\texttt{smartdailer.asr}): Houses the abstract \texttt{ASRBase} interface, the CUDA-accelerated \texttt{WhisperASR}, the NeMo-powered \texttt{ParakeetASR}, and the factory selector.
+    \item \textbf{TTS Subsystem} (\texttt{smartdailer.tts}): Provides local non-blocking Windows SAPI5 voice generation (\texttt{LocalWindowsTTS}) and neural cloud fallback (\texttt{EdgeTTSEngine}).
+    \item \textbf{Dialogue Brain Layer} (\texttt{smartdailer.brain}): Provides state-driven scenario progression (\texttt{ScenarioBrain}) and OpenAI/Ollama/Groq-compatible LLM orchestration (\texttt{LLMBrain}).
+    \item \textbf{Orchestration \& WebRTC Layer} (\texttt{smartdailer.orchestrator} and \texttt{smartdailer.livekit}): Coordinates turn-taking loops, synchronizes wall-clock playback with ASR ingestion, and binds to LiveKit WebRTC rooms.
+\end{enumerate}
+
+\newpage
+
+\chapter{Mathematical Formulation of Sliding-Window Streaming ASR}
+
+\section{Audio Representation and Discretization}
+Let an analog acoustic signal be denoted by $x(t) \in \mathbb{R}$. In accordance with the Nyquist-Shannon sampling theorem, the continuous audio wave is discretized at a sampling frequency $f_s = 16\,000\text{ Hz}$ (16 kHz), yielding a discrete sequence of pulse-code modulation (PCM) samples:
+\begin{equation}
+    x[n] = x\left(\frac{n}{f_s}\right), \quad n \in \mathbb{Z}
+\end{equation}
+The quantization resolution is 16-bit signed integer format ($[-32768, 32767]$), which is normalized in software to single-precision 32-bit floating-point values:
+\begin{equation}
+    s[n] = \frac{x[n]}{32768.0} \in [-1.0, 1.0], \quad s[n] \in \mathbb{R}
+\end{equation}
+All downstream models in SmartDialer (CTranslate2 Whisper and NVIDIA NeMo Parakeet) ingest mono 1-D arrays of float32 tensors with $f_s = 16\,000\text{ Hz}$. If multi-channel input is detected from WebRTC or audio hardware, stereo downmixing is executed via channel-wise linear averaging:
+\begin{equation}
+    s_{\text{mono}}[n] = \frac{1}{C} \sum_{c=1}^{C} s_c[n]
+\end{equation}
+
+\section{Sliding Window Geometry}
+The streaming buffer operates as a temporal sliding window characterized by three primary parameters:
+\begin{enumerate}
+    \item \textbf{Window Duration ($T_w$)}: $2.5\text{ seconds}$
+    \item \textbf{Overlap Duration ($T_o$)}: $0.5\text{ seconds}$
+    \item \textbf{Step / Hop Duration ($T_s$)}: $T_s = T_w - T_o = 2.0\text{ seconds}$
+\end{enumerate}
+
+Expressed in discrete sample counts at $f_s = 16\,000\text{ Hz}$:
+\begin{align}
+    N_w &= T_w \times f_s = 2.5 \times 16\,000 = 40\,000\text{ samples} \\
+    N_o &= T_o \times f_s = 0.5 \times 16\,000 = 8\,000\text{ samples} \\
+    N_s &= N_w - N_o = 40\,000 - 8\,000 = 32\,000\text{ samples}
+\end{align}
+
+\begin{figure}[h!]
+\centering
+\begin{picture}(400,90)
+    % Chunk 1
+    \put(20,50){\line(1,0){250}}
+    \put(20,70){\line(1,0){250}}
+    \put(20,50){\line(0,1){20}}
+    \put(270,50){\line(0,1){20}}
+    \put(90,57){\textbf{Chunk 1} [$0.0\text{s} - 2.5\text{s}$] ($N_w = 40\,000$)}
+    
+    % Chunk 2
+    \put(220,20){\line(1,0){250}}
+    \put(220,40){\line(1,0){250}}
+    \put(220,20){\line(0,1){20}}
+    \put(470,20){\line(0,1){20}}
+    \put(290,27){\textbf{Chunk 2} [$2.0\text{s} - 4.5\text{s}$] ($N_w = 40\,000$)}
+    
+    % Overlap region
+    \put(220,40){\line(0,1){10}}
+    \put(270,40){\line(0,1){10}}
+    \put(225,43){\small Overlap $0.5\text{s}$}
+\end{picture}
+\caption{Sliding window geometry demonstrating temporal step ($T_s=2.0\text{s}$) and acoustic overlap ($T_o=0.5\text{s}$).}
+\label{fig:window_geometry}
+\end{figure}
+
+Let $k \in \{0, 1, 2, \dots\}$ denote the zero-indexed chunk index. The $k$-th audio slice $\mathcal{C}_k$ extracted from the continuous streaming signal is defined as:
+\begin{equation}
+    \mathcal{C}_k = \{ s[n] \mid k \cdot N_s \le n < k \cdot N_s + N_w \}
+\end{equation}
+The temporal start and end boundaries (in seconds relative to the start of speech) are given by:
+\begin{equation}
+    t_{\text{start}}^{(k)} = \frac{k \cdot N_s}{f_s} = k \cdot 2.0\text{ s}, \qquad
+    t_{\text{end}}^{(k)} = t_{\text{start}}^{(k)} + T_w = k \cdot 2.0 + 2.5\text{ s}
+\end{equation}
+
+\section{Remainder Flushing and Boundary Completeness}
+Speech utterances do not conclude on exact integer multiples of the hop size $N_s$. Let the total length of an incoming speech utterance be $L$ samples. The number of full sliding-window chunks produced is:
+\begin{equation}
+    K = \left\lfloor \frac{L - N_o}{N_s} \right\rfloor = \left\lfloor \frac{L - 8\,000}{32\,000} \right\rfloor
+\end{equation}
+Upon speech cessation (detected via silence or turn finalization), an audio remainder $\mathcal{R}$ remains in the buffer:
+\begin{equation}
+    \mathcal{R} = \{ s[n] \mid K \cdot N_s \le n < L \}
+\end{equation}
+The remainder length is $L_{\text{rem}} = L - K \cdot N_s$. To guarantee that trailing phonemes (such as word suffixes, plosives, and nasal consonants) are not discarded, the \texttt{flush()} procedure evaluates $L_{\text{rem}}$ against a minimum duration threshold $T_{\text{min}} = 0.2\text{ seconds}$ ($N_{\text{min}} = 3\,200\text{ samples}$):
+\begin{equation}
+    \text{If } L_{\text{rem}} \ge N_{\text{min}}, \quad \mathcal{C}_{\text{flush}} = \mathcal{R}
+\end{equation}
+The remainder is immediately dispatched to the ASR engine, ensuring that no speech is lost at the turn boundary.
+
+\newpage
+
+\chapter{Comparative Architecture of ASR Backends}
+
+\section{Faster-Whisper: Architecture and CUDA FP16 Optimization}
+Faster-Whisper is a reimplementation of OpenAI's Whisper model utilizing \textbf{CTranslate2}, a fast inference engine for Transformer models written in C++ and CUDA. 
+
+\subsection{Model Topology}
+Whisper is an encoder-decoder sequence-to-sequence model trained on 680,000 hours of multilingual and multitask audio. The audio input is transformed into an 80-channel log-magnitude Mel spectrogram:
+\begin{equation}
+    M(f, t) = \log\left( \text{MelFilterBank}\left( |\text{STFT}(s)|^2 \right) \right)
+\end{equation}
+The 80-channel Mel spectrogram is processed by two 1-D convolutional layers with a stride of 2, followed by a Transformer encoder consisting of $N_e$ self-attention layers. The Transformer decoder autoregressively emits BPE token probabilities.
+
+\subsection{CTranslate2 Optimizations}
+In standard HuggingFace PyTorch implementations, Whisper suffers from substantial Python overhead, kernel launch latency, and memory fragmentation. CTranslate2 replaces PyTorch's execution graph with optimized C++ kernels:
+\begin{itemize}
+    \item \textbf{FP16 Tensor Core Acceleration}: Activations and weights are mapped to 16-bit floating point representations, leveraging the NVIDIA Ampere architecture's Tensor Cores (RTX 3060 Laptop GPU).
+    \item \textbf{Greedy Decoding with Beam Size $B=1$}: For real-time conversational agents, beam search introduces excessive latency. SmartDialer sets $B=1$, reducing decoding complexity from $\mathcal{O}(B \cdot V \cdot T)$ to $\mathcal{O}(V \cdot T)$.
+    \item \textbf{Independent Chunk Conditioning}: Setting \texttt{condition\_on\_previous\_text=False} prevents error propagation across sliding-window chunks, which is essential when processing audio in 2.5-second windows.
+    \item \textbf{Domain Prompt Biasing}: By supplying \texttt{initial\_prompt="SmartDialer, call center voice agent"}, the decoder's prior distribution is conditioned to recognize domain terms with exact casing.
+\end{itemize}
+
+\section{NVIDIA Parakeet: NeMo Conformer-CTC Architecture}
+NVIDIA Parakeet is an Automatic Speech Recognition family developed by NVIDIA NeMo, trained on over 65,000 hours of English speech from diverse acoustic domains. The SmartDialer engine utilizes the \textbf{Parakeet-CTC 0.6B} model (\texttt{nvidia/parakeet-ctc-0.6b}).
+
+\subsection{Conformer Architecture}
+The Conformer (Convolution-augmented Transformer) combines self-attention with depthwise separable convolution layers. While standard self-attention captures global acoustic context, depthwise convolution effectively models local shift-invariant feature interactions:
+\begin{equation}
+    \text{ConformerBlock}(y) = y + \frac{1}{2}\text{FFN}(y) + \text{MHSA}(y) + \text{Conv}(y) + \frac{1}{2}\text{FFN}(y)
+\end{equation}
+where $\text{MHSA}$ represents Multi-Head Self-Attention with relative positional encodings, and $\text{Conv}$ represents the convolution module containing LayerNorm, pointwise convolution, GLU activation, depthwise 1-D convolution, BatchNorm, and Swish activation.
+
+\subsection{Connectionist Temporal Classification (CTC)}
+Unlike Whisper's autoregressive encoder-decoder, Parakeet-CTC utilizes a non-autoregressive CTC loss and decoder. Given input acoustic frames $X = (x_1, \dots, x_T)$ and target transcript $Y = (y_1, \dots, y_U)$, CTC introduces a blank token $\epsilon$ to align variable-length sequences:
+\begin{equation}
+    P(Y \mid X) = \sum_{\pi \in \mathcal{B}^{-1}(Y)} \prod_{t=1}^{T} P(\pi_t \mid x_t)
+\end{equation}
+Because decoding is non-autoregressive, all output tokens are generated in a single forward pass, eliminating recurrent decoding steps.
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Metric / Feature} & \textbf{Faster-Whisper (Base)} & \textbf{NVIDIA Parakeet-CTC (0.6B)} \\
+\midrule
+Model Architecture & Encoder-Decoder Transformer & Conformer Encoder + CTC \\
+Parameter Count & 74 Million & 600 Million \\
+Decoding Paradigm & Autoregressive Sequence-to-Sequence & Non-Autoregressive CTC \\
+Vocab / Tokenizer & 51,865 (Multilingual BPE) & 1,024 (SentencePiece Unigram) \\
+GPU VRAM Footprint & $\approx 500\text{ MB}$ (FP16) & $\approx 2.4\text{ GB}$ (FP32/FP16) \\
+Inference Latency (2.5s Chunk) & $45 - 75\text{ ms}$ (RTX 3060) & $60 - 90\text{ ms}$ (RTX 3060) \\
+Punctuation / Casing & Native Capitalization \& Periods & Normalized Lowercase (No Punctuation) \\
+Hallucination Tendency & Low-to-Moderate in Background Silence & Zero (CTC outputs blank on silence) \\
+Telephony Robustness & Moderate (without fine-tuning) & High (trained on noisy call datasets) \\
+\bottomrule
+\end{tabular}
+\caption{System-level comparison between Faster-Whisper and NVIDIA Parakeet-CTC on the SmartDialer architecture.}
+\label{tab:asr_comparison}
+\end{table}
+
+\newpage
+
+\chapter{Transcript Reconciliation and Boundary Deduplication}
+
+\section{The Acoustic Boundary Overlap Problem}
+Because consecutive sliding-window chunks overlap by $T_o = 0.5\text{ seconds}$ (8,000 samples), spoken words positioned within the overlap interval will be captured by both Chunk $k$ and Chunk $k+1$. 
+
+Consider the utterance: \textit{``Hello, this is Alex from SmartDialer. I am calling to see if you are interested in automating your call center workflow.''}
+\begin{itemize}
+    \item \textbf{Chunk 2} ($2.0\text{s} - 4.5\text{s}$): Transcribes \textit{``I am calling to see if you are...''}
+    \item \textbf{Chunk 3} ($4.0\text{s} - 6.5\text{s}$): Transcribes \textit{``if you are interested in automating your call center work.''}
+    \item \textbf{Chunk 4} ($6.0\text{s} - 7.4\text{s}$): Transcribes \textit{``enter workflow.''}
+\end{itemize}
+
+A naive concatenation of chunk transcripts produces severe linguistic stuttering:
+\begin{quote}
+    \texttt{"Hello this is Alex from SmartDialer I am calling to see if you are if you are interested in automating your call center work enter workflow"}
+\end{quote}
+Notice two distinct types of errors:
+\begin{enumerate}
+    \item \textbf{Exact Boundary Token Duplication}: The phrase \textit{``if you are''} is transcribed at the end of Chunk 2 and at the start of Chunk 3.
+    \item \textbf{Phonetic Splitting / Truncation}: The word \textit{``center''} spans across the $4.0\text{s}$ boundary. Chunk 3 captures the tail (\textit{``center work''}), while Chunk 4 captures only the second syllable (\textit{``enter workflow''}).
+\end{enumerate}
+
+\section{Token Normalization and Boundary Alignment}
+To resolve duplicates, SmartDialer implements a boundary reconciliation algorithm in \texttt{ASRBase.reconcile\_overlapping\_chunks()}.
+
+\subsection{Token Normalization Function}
+Before computing overlap, tokens must be normalized to strip capitalization, trailing hesitation hyphens (which Whisper outputs when speech cuts abruptly), em-dashes, and trailing pause ellipses:
+\begin{equation}
+    \text{norm}(w) = \text{regex\_replace}(w, \texttt{[}\text{\textasciicircum}\backslash\text{w}\texttt{]}, \text{""}).\text{lower}()
+\end{equation}
+For example:
+\begin{align*}
+    \text{norm}(\text{"are..."}) &= \text{"are"} \\
+    \text{norm}(\text{"have-"}) &= \text{"have"} \\
+    \text{norm}(\text{"SmartDialer."}) &= \text{"smartdialer"}
+\end{align*}
+
+\subsection{Suffix-Prefix Longest Common Match}
+Let the accumulated word sequence up to chunk $k$ be $\mathcal{W}_{\text{acc}} = (w_1, w_2, \dots, w_M)$, and let the candidate words from chunk $k+1$ be $\mathcal{W}_{\text{new}} = (u_1, u_2, \dots, u_P)$.
+
+We evaluate candidate overlap lengths $m \in \{1, 2, \dots, \min(M, P, K_{\text{max}})\}$, where $K_{\text{max}} = 6$ words:
+\begin{equation}
+    m^* = \max \left\{ m \;\middle|\; \forall j \in \{1, \dots, m\}, \; \text{norm}(w_{M - m + j}) = \text{norm}(u_j) \right\}
+\end{equation}
+If $m^* > 0$, an exact overlap of $m^*$ words is detected. The accumulated transcript is updated by appending only the non-overlapping suffix of chunk $k+1$:
+\begin{equation}
+    \mathcal{W}_{\text{acc}} \leftarrow \mathcal{W}_{\text{acc}} \mathbin{\Vert} (u_{m^*+1}, \dots, u_P)
+\end{equation}
+
+\subsection{Subsequence and Truncated Syllable Recovery}
+If $m^* = 0$, the algorithm investigates whether acoustic truncation severed a boundary word. Let $w_M$ be the final word of $\mathcal{W}_{\text{acc}}$ and $u_1$ be the initial word of $\mathcal{W}_{\text{new}}$:
+\begin{equation}
+    \text{If } \text{norm}(w_M) \subset \text{norm}(u_1) \text{ and } |\text{norm}(w_M)| \ge 3:
+\end{equation}
+This indicates that Chunk $k$ received an incomplete root (e.g., \textit{``work''}), while Chunk $k+1$ received the complete compound word (\textit{``workflow''}). In this case, $w_M$ is popped from $\mathcal{W}_{\text{acc}}$, and $\mathcal{W}_{\text{new}}$ is appended in its entirety.
+
+Similarly, if the penultimate token of Chunk $k$ matches $u_1$ ($\text{norm}(w_{M-1}) = \text{norm}(u_1)$), the severed boundary token $w_M$ is discarded, realigning the sentence stream.
+
+\begin{lstlisting}[language=Python, caption={Sliding-window transcript reconciliation algorithm.}]
+@classmethod
+def reconcile_overlapping_chunks(cls, chunk_texts: List[str]) -> str:
+    cleaned = [t.strip() for t in chunk_texts if t.strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0].rstrip("- ")
+
+    merged = cleaned[0].split()
+    for text in cleaned[1:]:
+        current = text.split()
+        if not current:
+            continue
+        if merged:
+            merged[-1] = re.sub(r"[-.]+$", "", merged[-1])
+
+        max_k = min(len(merged), len(current), 6)
+        best_k = 0
+        for k in range(max_k, 0, -1):
+            suf = [cls._normalize_token(w) for w in merged[-k:]]
+            pre = [cls._normalize_token(w) for w in current[:k]]
+            if suf == pre and all(bool(x) for x in suf):
+                best_k = k
+                break
+
+        if best_k > 0:
+            merged.extend(current[best_k:])
+        else:
+            # Check for partial boundary word overlap
+            last_norm = cls._normalize_token(merged[-1])
+            first_norm = cls._normalize_token(current[0])
+            if last_norm and first_norm and (last_norm == first_norm or (last_norm in first_norm and len(last_norm) >= 3)):
+                merged.pop()
+                merged.extend(current)
+            else:
+                merged.extend(current)
+
+    return " ".join(merged)
+\end{lstlisting}
+
+\newpage
+
+\chapter{Speech Synthesis and Audio Output Architecture}
+
+\section{Real-Time Text-to-Speech Strategy}
+In a dual-agent conversational loop, Text-to-Speech (TTS) serves as the acoustic bridge between Agent $i$'s cognitive brain and Agent $j$'s listening ASR buffer. 
+The system requires:
+\begin{itemize}
+    \item Sub-100 ms synthesis initiation latency.
+    \item Acoustic separation: Agent A and Agent B must possess distinct vocal timbres (e.g., male vs. female vocal tract characteristics) to prevent model confusion.
+    \item Non-blocking execution: Generation and playback must never block asynchronous task scheduling.
+\end{itemize}
+
+\section{Windows SAPI5 Non-Blocking COM Architecture}
+While external cloud TTS engines (e.g., ElevenLabs, Cartesia, or Microsoft Azure Speech) offer high naturalness, they introduce network round-trip latency (150--350 ms) and require active API subscriptions. 
+
+SmartDialer implements a high-performance offline TTS engine in \texttt{LocalWindowsTTS} utilizing the Microsoft Speech API (SAPI5) via Python's \texttt{win32com.client}.
+
+\subsection{COM Apartment Threading and Stream Redirection}
+Standard third-party libraries (such as \texttt{pyttsx3}) encounter severe deadlock conditions on Windows during rapid multi-turn conversations. \texttt{pyttsx3} wraps the SAPI5 engine in an internal event loop (\texttt{engine.runAndWait()}). When called consecutively across multiple turns, the SAPI5 COM apartment thread terminates the pump prematurely, causing permanent process deadlocks.
+
+SmartDialer resolves this by bypassing \texttt{pyttsx3} entirely, directly instantiating the low-level SAPI COM objects:
+\begin{itemize}
+    \item \texttt{SAPI.SpVoice}: The speech synthesis engine.
+    \item \texttt{SAPI.SpFileStream}: The file output stream sink.
+\end{itemize}
+
+\begin{lstlisting}[language=Python, caption={Non-blocking SAPI5 COM speech synthesis.}]
+sp_voice = win32com.client.Dispatch("SAPI.SpVoice")
+sp_voice.Rate = 1  # Natural conversational rate
+
+# Select requested voice identity
+if voice:
+    voice_lower = voice.lower()
+    voices = sp_voice.GetVoices()
+    for i in range(voices.Count):
+        if voice_lower in voices.Item(i).GetDescription().lower():
+            sp_voice.Voice = voices.Item(i)
+            break
+
+with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+    temp_path = tf.name
+
+sp_stream = win32com.client.Dispatch("SAPI.SpFileStream")
+sp_stream.Open(temp_path, 3)  # 3 = SSFMCreateForWrite
+sp_voice.AudioOutputStream = sp_stream
+sp_voice.Speak(text)
+sp_stream.Close()
+
+audio, sr = sf.read(temp_path, dtype="float32")
+return resample_audio(audio, sr, 16000)
+\end{lstlisting}
+
+This architecture offers key operational advantages:
+\begin{enumerate}
+    \item \textbf{Deterministic Teardown}: \texttt{sp\_stream.Close()} flushes all operating system file handles synchronously, eliminating COM apartment deadlock.
+    \item \textbf{Vocal Diversity}: The engine binds to installed Windows desktop voices:
+    \begin{itemize}
+        \item \textbf{Agent A}: \texttt{Microsoft David Desktop} (Male, US English, 16 kHz).
+        \item \textbf{Agent B}: \texttt{Microsoft Zira Desktop} (Female, US English, 16 kHz).
+    \end{itemize}
+    \item \textbf{Instant Synthesis}: A 7-second conversational utterance is synthesized to 16 kHz PCM in under $85\text{ milliseconds}$.
+\end{enumerate}
+
+\section{Real-Time Physical Audio Output with SoundDevice}
+To enable operators to audit conversations in real time, \texttt{DualAgentConversation} integrates with \texttt{sounddevice} (PortAudio wrapper).
+
+When Agent $i$ finishes synthesizing a turn's audio $s[n]$:
+\begin{equation}
+    \texttt{sd.play}(s[n], f_s = 16\,000)
+\end{equation}
+Because \texttt{sd.play()} executes asynchronously on a background PortAudio thread, playback begins immediately. Concurrently, the orchestrator streams 200 ms audio frames into the receiving agent's \texttt{AudioChunkBuffer} matching wall-clock time. Consequently, the operator hears the agent speaking through physical speakers while observing the transcribed chunks appear in the console in real time.
+
+\newpage
+
+\chapter{Autonomous Dual-Agent Conversational Orchestration}
+
+\section{Turn-Taking State Machine}
+Conversational dialogue between two autonomous agents is modeled as an alternating finite-state machine (FSM):
+
+\begin{figure}[h!]
+\centering
+\begin{picture}(420,120)
+    % Agent A Box
+    \put(30,70){\framebox(140,40){\textbf{Agent A (Speaker)}}}
+    % Agent B Box
+    \put(250,70){\framebox(140,40){\textbf{Agent B (Listener)}}}
+    
+    % Arrows
+    \put(170,95){\vector(1,0){80}}
+    \put(175,102){\small 1. Synthesize Audio}
+    \put(175,82){\small 2. Stream 2.5s Chunks}
+    
+    \put(320,70){\line(0,-1){40}}
+    \put(320,30){\line(-1,0){220}}
+    \put(100,30){\vector(0,1){40}}
+    
+    \put(160,35){\small 3. Reconcile Transcript $\rightarrow$ Think $\rightarrow$ Respond}
+\end{picture}
+\caption{Turn-taking dialogue loop between Agent A and Agent B.}
+\label{fig:turn_taking}
+\end{figure}
+
+The state transitions follow a rigid sequence:
+\begin{enumerate}
+    \item \textbf{Speaker Generation}: Speaker generates text utterance $\mathcal{T}_{\text{curr}}$.
+    \item \textbf{Acoustic Synthesis}: Speaker TTS generates float32 audio $s_{\text{turn}}[n]$.
+    \item \textbf{Streaming Ingestion}: $s_{\text{turn}}[n]$ is pushed into Listener's \texttt{AudioChunkBuffer} in temporal increments, triggering sliding-window ASR transcribing in 2.5-second chunks ($0.5\text{s}$ overlap).
+    \item \textbf{Transcript Reconciliation}: Upon turn conclusion, raw chunk texts are deduplicated by \texttt{reconcile\_overlapping\_chunks()} to yield $\mathcal{T}_{\text{reconciled}}$.
+    \item \textbf{Cognitive Deliberation}: Listener's brain ingests $\mathcal{T}_{\text{reconciled}}$ along with conversation history $\mathcal{H}$, returning response $\mathcal{T}_{\text{next}}$.
+    \item \textbf{Role Reversal}: Listener becomes Speaker, and Speaker becomes Listener.
+\end{enumerate}
+
+\section{Cognitive Brain Implementations}
+The platform defines an abstract interface \texttt{BrainBase} with two implementations:
+
+\subsection{Deterministic Scenario Brain (\texttt{ScenarioBrain})}
+For continuous integration testing, regression analysis, and zero-cost local evaluation, \texttt{ScenarioBrain} models scripted sales dialer scenarios:
+\begin{itemize}
+    \item \textbf{Alex (Outbound Dialer Representative)}: Introduces SmartDialer, details technical streaming advantages, addresses turn-taking inquiries, and books calendar demonstrations.
+    \item \textbf{Jordan (Prospective Enterprise Client)}: Expresses interest in low-latency voice solutions, inquires about background noise handling, and confirms availability.
+\end{itemize}
+
+\subsection{Large Language Model Brain (\texttt{LLMBrain})}
+For dynamic open-ended conversations, \texttt{LLMBrain} wraps the OpenAI API client, enabling connectivity to:
+\begin{itemize}
+    \item OpenAI GPT-4o / GPT-4o-mini
+    \item Local Ollama instances (\texttt{http://localhost:11434/v1}) running Llama-3.3-8B or Mistral-Small
+    \item Groq ultra-high-speed inference endpoints (LPU acceleration)
+    \item vLLM self-hosted inference clusters
+\end{itemize}
+
+\newpage
+
+\chapter{LiveKit WebRTC Integration and Telephony Architecture}
+
+\section{WebRTC Protocol Architecture and Audio Transport}
+In local testing, agents exchange raw NumPy arrays in process memory. In production, agents must converse across distributed networks, web browsers, mobile applications, and Public Switched Telephone Networks (PSTN).
+
+LiveKit provides an open-source WebRTC infrastructure and Agent Framework:
+\begin{itemize}
+    \item \textbf{Selective Forwarding Unit (SFU)}: LiveKit Server routes WebRTC media tracks with minimal latency ($<20\text{ ms}$).
+    \item \textbf{Opus Audio Codec}: Interactive audio is dynamically encoded in Opus with adaptive bitrate (16--64 kbps), forward error correction (FEC), and packet loss concealment (PLC).
+    \item \textbf{Framing}: WebRTC operates at a standard packetization interval of 20 ms (320 samples at 16 kHz).
+\end{itemize}
+
+\section{Custom LiveKit STT Adapter (\texttt{LiveKitChunkedSTT})}
+To bridge our 2.5s chunk with 0.5s overlap ASR engine into LiveKit, we implemented a custom subclass of \texttt{livekit.agents.stt.STT} and \texttt{livekit.agents.stt.RecognizeStream}.
+
+\subsection{Adapter Architecture}
+When an incoming audio track is subscribed in a LiveKit room, LiveKit's \texttt{rtc.AudioStream} emits individual 20 ms \texttt{rtc.AudioFrame} objects. \texttt{ChunkedRecognizeStream} receives these frames, unpacks the 16-bit PCM bytes into float32, and pushes them into \texttt{AudioChunkBuffer}.
+
+Whenever the buffer accumulates 40,000 samples (2.5 seconds), a chunk is emitted to the ASR engine (Whisper or Parakeet). The transcript is wrapped into a LiveKit \texttt{SpeechEvent}:
+\begin{equation}
+    \texttt{SpeechEvent}(\text{type} = \texttt{INTERIM\_TRANSCRIPT}, \text{text} = \mathcal{T}_{\text{chunk}})
+\end{equation}
+When the caller stops speaking, \texttt{recognizer.end\_input()} flushes the buffer and emits:
+\begin{equation}
+    \texttt{SpeechEvent}(\text{type} = \texttt{FINAL\_TRANSCRIPT}, \text{text} = \mathcal{T}_{\text{reconciled}})
+\end{equation}
+
+\begin{figure}[h!]
+\centering
+\begin{picture}(420,110)
+    % WebRTC frame
+    \put(20,70){\framebox(80,30){\shortstack{LiveKit SFU\\20ms Frames}}}
+    \put(100,85){\vector(1,0){30}}
+    
+    % RecognizeStream
+    \put(130,70){\framebox(90,30){\shortstack{ChunkedRecognize\\Stream}}}
+    \put(220,85){\vector(1,0){30}}
+    
+    % Buffer
+    \put(250,70){\framebox(80,30){\shortstack{AudioBuffer\\2.5s / 0.5s}}}
+    \put(330,85){\vector(1,0){30}}
+    
+    % Engine
+    \put(360,70){\framebox(60,30){\shortstack{Whisper /\\Parakeet}}}
+    
+    % Return event
+    \put(390,70){\line(0,-1){35}}
+    \put(390,35){\line(-1,0){215}}
+    \put(175,35){\vector(0,1){35}}
+    \put(210,40){\small SpeechEvent(INTERIM\_TRANSCRIPT)}
+\end{picture}
+\caption{LiveKit custom STT streaming pipeline.}
+\label{fig:livekit_stt}
+\end{figure}
+
+\section{LiveKit Audio Publishing (\texttt{LiveKitAudioPublisher})}
+Synthesized agent speech is published into the room via \texttt{rtc.AudioSource} and \texttt{rtc.LocalAudioTrack}. The audio is chopped into 20 ms frames and pushed via \texttt{source.capture\_frame(frame)} with precise wall-clock sleep pacing to prevent buffer overflow in the WebRTC jitter buffer.
+
+\section{SIP Telephony Integration}
+For enterprise smart dialers, LiveKit provides \textbf{LiveKit SIP}:
+\begin{equation}
+    \text{PSTN Caller} \xrightarrow{\text{SIP Trunk}} \text{Twilio / Telnyx} \xrightarrow{\text{SIP}} \text{LiveKit SIP Service} \xrightarrow{\text{WebRTC}} \text{SmartDialer Worker}
+\end{equation}
+When a phone call is placed or received:
+\begin{enumerate}
+    \item LiveKit creates a room associated with the SIP call ID.
+    \item The SmartDialer \texttt{agent\_worker.py} process joins the room automatically.
+    \item The caller's voice is processed in 2.5-second chunks through Whisper/Parakeet.
+    \item The agent responds over the phone line with natural turn-taking.
+\end{enumerate}
+
+\newpage
+
+\chapter{Engineering Post-Mortem and Technical Challenges Resolved}
+
+During the engineering lifecycle of SmartDialer, multiple non-trivial system-level bugs were encountered across Windows OS interfaces, CUDA runtimes, and COM apartments. This chapter documents the root-cause analyses and resolutions.
+
+\section{Issue 1: CTranslate2 Windows CUDA DLL Resolution Failure}
+\subsection{Symptom}
+Upon initializing \texttt{WhisperModel("base", device="cuda", compute\_type="float16")}, CTranslate2 threw:
+\begin{quote}
+    \texttt{RuntimeError: Library cublas64\_12.dll is not found or cannot be loaded}
+\end{quote}
+despite \texttt{nvidia-smi} reporting an active RTX 3060 Laptop GPU with driver version 595.79 and CUDA 13.2 support.
+
+\subsection{Root Cause}
+On Windows, when CUDA runtime libraries are installed via Python pip wheels (\texttt{nvidia-cublas-cu12}, \texttt{nvidia-cudnn-cu12}), the native DLLs reside inside \texttt{site-packages\textbackslash nvidia\textbackslash cublas\textbackslash bin\textbackslash cublas64\_12.dll}. Because Windows restricts standard DLL search paths, CTranslate2's C++ dynamic loader (\texttt{LoadLibraryEx}) fails to locate the DLLs unless explicitly registered.
+
+\subsection{Resolution}
+We implemented an automatic DLL path discovery routine in \texttt{whisper\_asr.py} executed prior to importing \texttt{ctranslate2}:
+\begin{lstlisting}[language=Python]
+def _setup_cuda_dll_paths():
+    if sys.platform != "win32":
+        return
+    added_dirs = []
+    for pkg_dir in site.getsitepackages():
+        nvidia_root = os.path.join(pkg_dir, "nvidia")
+        if os.path.isdir(nvidia_root):
+            for sub in os.listdir(nvidia_root):
+                bin_dir = os.path.join(nvidia_root, sub, "bin")
+                if os.path.isdir(bin_dir):
+                    try:
+                        os.add_dll_directory(bin_dir)
+                    except Exception:
+                        pass
+                    added_dirs.append(bin_dir)
+    if added_dirs:
+        os.environ["PATH"] = ";".join(added_dirs) + ";" + os.environ.get("PATH", "")
+\end{lstlisting}
+
+\section{Issue 2: SAPI5 COM Deadlocks During Multi-Turn Synthesis}
+\subsection{Symptom}
+In \texttt{pyttsx3}, Turn 1 synthesized successfully, but Turn 2 froze permanently on:
+\begin{quote}
+    \texttt{Jordan (Client) is speaking... [HUNG]}
+\end{quote}
+
+\subsection{Root Cause}
+\texttt{pyttsx3} initializes an internal COM event loop via \texttt{comtypes}. Calling \texttt{save\_to\_file} followed by \texttt{runAndWait()} tears down the COM pump. On subsequent turns, re-instantiating \texttt{pyttsx3.init()} deadlocks the Windows SAPI5 Single-Threaded Apartment (STA).
+
+\subsection{Resolution}
+We removed \texttt{pyttsx3} entirely and implemented direct SAPI5 COM stream control via \texttt{win32com.client}:
+\begin{lstlisting}[language=Python]
+sp_voice = win32com.client.Dispatch("SAPI.SpVoice")
+sp_stream = win32com.client.Dispatch("SAPI.SpFileStream")
+sp_stream.Open(temp_path, 3) # SSFMCreateForWrite
+sp_voice.AudioOutputStream = sp_stream
+sp_voice.Speak(text)
+sp_stream.Close()
+\end{lstlisting}
+Because \texttt{sp\_stream.Close()} explicitly unbinds the stream handle, COM apartments remain clean, executing in $<85\text{ ms}$ without deadlock.
+
+\section{Issue 3: Windows Console CP1252 Unicode Character Encoding}
+\subsection{Symptom}
+Console logging crashed with:
+\begin{quote}
+    \texttt{UnicodeEncodeError: 'charmap' codec can't encode character '\textbackslash u2192' in position 1}
+\end{quote}
+
+\subsection{Root Cause}
+Legacy Windows consoles default to code page 1252 (CP1252), which does not support Unicode mathematical symbols such as the right arrow (\texttt{\textbackslash u2192}).
+
+\subsection{Resolution}
+Two safeguards were applied:
+\begin{enumerate}
+    \item Standard ASCII separators (\texttt{"|"} or \texttt{"->"}) replaced Unicode arrows in formatting strings.
+    \item Automatic UTF-8 reconfiguration was added at entrypoint initialization:
+    \begin{lstlisting}[language=Python]
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    \end{lstlisting}
+\end{enumerate}
+
+\section{Issue 4: PyTorch and CTranslate2 cuDNN DLL Version Conflict}
+\subsection{Symptom}
+When running NVIDIA Parakeet on CUDA, NeMo threw:
+\begin{quote}
+    \texttt{Could not load symbol cudnnGetLibConfig. Error code 127}
+\end{quote}
+
+\subsection{Root Cause}
+CTranslate2 required pip's \texttt{nvidia-cudnn-cu12==9.27}, while PyTorch 2.6.0 bundled an internal cuDNN 9.1 runtime in \texttt{torch\textbackslash lib}. When NeMo invoked PyTorch CUDA convolutions, dynamic linking bound to the wrong cuDNN DLL.
+
+\subsection{Resolution}
+Because NVIDIA Parakeet is a Conformer model using depthwise 1-D convolutions and self-attention (rather than recurrent LSTM layers), cuDNN's proprietary RNN library is not required. Disabling cuDNN via PyTorch configuration:
+\begin{lstlisting}[language=Python]
+import torch
+torch.backends.cudnn.enabled = False
+\end{lstlisting}
+forced PyTorch to execute its native CUDA convolution kernels. Parakeet initialized on the GPU and completed inference without error.
+
+\section{Issue 5: LiveKit RecognizeStream Lifecycle Deadlock}
+\subsection{Symptom}
+In the LiveKit dual-agent simulation, Turn 1 printed Chunk 1, Chunk 2, and Chunk 3, but never progressed to the final transcript.
+
+\subsection{Root Cause}
+In LiveKit Agents, \texttt{RecognizeStream} is an asynchronous queue. Calling \texttt{recognizer.flush()} yields intermediate tokens but keeps the input channel open. The consumer loop \texttt{async for event in recognizer:} waited indefinitely for subsequent frames.
+
+\subsection{Resolution}
+We updated the stream lifecycle:
+\begin{enumerate}
+    \item Frame ingestion runs in an asynchronous background task (\texttt{pump\_frames()}).
+    \item Upon frame exhaustion, the pumper explicitly invokes \texttt{recognizer.end\_input()}.
+    \item \texttt{ChunkedRecognizeStream.\_run()} flushes trailing audio and terminates, closing the event queue and allowing the consumer to exit cleanly.
+\end{enumerate}
+
+\newpage
+
+\chapter{Developer Guide, Knowledge Transfer, and Operational Manual}
+
+\section{Repository Structure}
+The repository is organized into a clean Python package structure:
+\begin{lstlisting}[language=bash]
+smartdailer/
+|-- .gitignore                  # Excludes .venv, *.wav, outputs, caches
+|-- .python-version             # Python 3.12 pin
+|-- pyproject.toml              # UV / PEP 621 package metadata
+|-- uv.lock                     # Deterministic dependency lockfile
+|-- README.md                   # User documentation and quickstart
+|-- main.py                     # Standalone dual-agent CLI runner
+|-- play.py                     # Audio playback utility
+|-- livekit_main.py             # LiveKit WebRTC dual-room and worker CLI
+|-- docs/
+|   |-- technical_report.tex    # LaTeX source for this report
+|   `-- technical_report.pdf    # Compiled PDF report
+`-- src/
+    `-- smartdailer/
+        |-- __init__.py         # Package initialization
+        |-- config.py           # Dataclass configs (Audio, Whisper, Parakeet)
+        |-- agent.py            # VoiceAgent core class
+        |-- orchestrator.py     # DualAgentConversation turn manager
+        |-- audio/
+        |   |-- buffer.py       # AudioChunkBuffer (2.5s / 0.5s sliding window)
+        |   `-- utils.py        # Resampling, load/save WAV, concatenation
+        |-- asr/
+        |   |-- base.py         # Abstract ASRBase and reconcile algorithm
+        |   |-- whisper_asr.py  # Faster-Whisper with CUDA DLL discovery
+        |   |-- parakeet_asr.py # NVIDIA Parakeet NeMo 3.0 Conformer CTC
+        |   `-- factory.py      # ASR engine factory
+        |-- tts/
+        |   |-- base.py         # Abstract TTSBase
+        |   |-- local_tts.py    # Non-blocking Windows SAPI5 (David/Zira)
+        |   `-- edge_tts_engine.py # Edge-TTS neural engine
+        |-- brain/
+        |   |-- base.py         # Abstract BrainBase
+        |   |-- scenario_brain.py # Scripted dialer state machine
+        |   `-- llm_brain.py    # OpenAI / Ollama LLM integration
+        `-- livekit/
+            |-- chunked_stt.py  # LiveKit STT adapter
+            |-- audio_publisher.py # WebRTC 20ms frame publisher
+            |-- dual_agent_room.py # WebRTC multi-agent simulation
+            `-- agent_worker.py # LiveKit production agent worker
+\end{lstlisting}
+
+\section{Environment Setup with UV}
+The project uses \texttt{uv} for ultra-fast, reproducible virtual environment and package management:
+\begin{lstlisting}[language=bash]
+# 1. Clone repository
+git clone https://github.com/waleed-tahir/smartdailer.git
+cd smartdailer
+
+# 2. Sync dependencies
+uv sync
+
+# 3. Activate virtual environment
+.venv\Scripts\activate
+\end{lstlisting}
+
+\section{Execution Reference Manual}
+
+\subsection{Standalone In-Memory Conversation}
+\begin{lstlisting}[language=bash]
+# Run with Faster-Whisper on GPU (Default 4 turns with live speaker audio)
+python main.py --asr whisper --turns 4
+
+# Run with NVIDIA Parakeet on GPU
+python main.py --asr parakeet --turns 4
+
+# Run in headless fast batch mode (no live speaker audio)
+python main.py --turns 4 --no-live
+
+# Customize sliding window durations
+python main.py --chunk-sec 2.5 --overlap-sec 0.5 --turns 6
+\end{lstlisting}
+
+\subsection{LiveKit WebRTC Integration}
+\begin{lstlisting}[language=bash]
+# Switch to livekit branch
+git checkout livekit
+
+# Run dual-agent WebRTC simulation with NVIDIA Parakeet
+python livekit_main.py --mode dual --asr parakeet --turns 4
+
+# Run dual-agent WebRTC simulation with Faster-Whisper
+python livekit_main.py --mode dual --asr whisper --turns 4
+
+# Launch production LiveKit Agent Worker (connects to LiveKit Cloud / SIP)
+python livekit_main.py --mode worker --asr parakeet
+\end{lstlisting}
+
+\section{Operational Checklist for Incoming Engineers}
+When deploying or extending the SmartDialer codebase, verify the following:
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{GPU Acceleration}: Run \verb|.venv\Scripts\python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"|. Ensure output is $\ge 1$.
+    \item \textbf{NeMo Parakeet Cache}: The Parakeet model weights ($\approx 2.4\text{ GB}$) are permanently cached in \verb|%USERPROFILE%\.cache\huggingface\hub\models--nvidia--parakeet-ctc-0.6b|. Do not delete this directory in production environments to avoid re-download latencies.
+    \item \textbf{LiveKit Telephony Configuration}: When connecting to Twilio or Telnyx SIP trunks, ensure \texttt{LIVEKIT\_URL}, \texttt{LIVEKIT\_API\_KEY}, and \texttt{LIVEKIT\_API\_SECRET} are populated in \texttt{.env}.
+    \item \textbf{Audio Output Transducer}: In server or Docker environments without physical audio devices, execute scripts with the \texttt{--no-live} flag to prevent PortAudio host device initialization exceptions.
+\end{enumerate}
+
+\end{document}
