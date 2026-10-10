@@ -58,6 +58,11 @@ def parse_args():
         action="store_true",
         help="Disable real-time live speaker audio playback (run in headless fast mode)",
     )
+    parser.add_argument(
+        "--play",
+        action="store_true",
+        help="Alias to explicitly enable playback (enabled by default)",
+    )
     return parser.parse_args()
 
 
