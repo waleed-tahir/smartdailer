@@ -1,94 +1,70 @@
 # SmartDialer - Dual Voice Agent Framework
 
-A voice agent framework with chunked streaming transcription (2.5-second chunks with 0.5-second overlap), multi-agent dialogue loops, and modular support for both **Faster-Whisper** (GPU CUDA accelerated) and **NVIDIA Parakeet**.
+A voice agent framework with chunked streaming transcription (2.5-second chunks with 0.5-second overlap), multi-agent dialogue loops, modular support for **Faster-Whisper** and **NVIDIA Parakeet** (both GPU accelerated), and full **LiveKit WebRTC & SIP Telephony** integration.
 
 ---
 
 ## Architecture Overview
 
 ```
-[Agent A (Speaker)] ──> Synthesizes Audio (16kHz PCM)
+[Agent A (Speaker)] ──> WebRTC Track (20ms PCM Frames)
                                 │
                                 ▼
                        [AudioChunkBuffer]
                Window: 2.5s | Overlap: 0.5s | Step: 2.0s
                                 │
                                 ▼
-                      [ASR Engine (Whisper / Parakeet)]
+                   [ASR Engine (Whisper / Parakeet)]
                    Transcribes sliding window chunks
                                 │
                                 ▼
-                   [Transcript Reconciliation]
-             Deduplicates overlapping boundary words
+                    [Transcript Reconciliation]
+              Deduplicates overlapping boundary words
                                 │
                                 ▼
-                     [Agent B Brain (LLM / Script)]
+                      [Agent B Brain (LLM / Script)]
                                 │
                                 ▼
-[Agent B (Speaker)] ──> Synthesizes Audio ──> [Agent A Listens] ...
+[Agent B (Speaker)] ──> WebRTC Track ──> [Agent A Listens] ...
 ```
 
 ---
 
-## Features
+## LiveKit WebRTC Integration
 
-1. **Sliding-Window Audio Chunking**:
-   - Window size: **2.5 seconds** (40,000 samples @ 16kHz)
-   - Overlap: **0.5 seconds** (8,000 samples @ 16kHz)
-   - Step / Hop: **2.0 seconds** (32,000 samples @ 16kHz)
-   - Real-time chunk streaming with final remainder flush so no trailing words are lost.
+The `livekit` branch ports the SmartDialer architecture to the LiveKit ecosystem:
 
-2. **ASR Engines**:
-   - **Faster-Whisper**: GPU-accelerated CTranslate2 runtime with automatic Windows CUDA DLL discovery and float16/int8 precision.
-   - **NVIDIA Parakeet**: Native integration class (`ParakeetASR`) ready for NeMo (`nvidia/parakeet-ctc-0.6b` / `nvidia/parakeet-tdt-1.1b`) or HuggingFace.
-
-3. **Dual-Agent Dialogue Orchestrator**:
-   - Agents speak, listen, transcribe each other's audio through chunked ASR, and reply back and forth.
-   - Saves master dialogue recording to `outputs/conversation.wav`.
-
-4. **Multi-Engine Dialogue Brains**:
-   - `ScenarioBrain`: Deterministic script engine for instant offline testing without API keys.
-   - `LLMBrain`: OpenAI, Groq, Ollama, or any OpenAI-compatible LLM endpoint.
+- **Custom LiveKit STT Adapter (`LiveKitChunkedSTT`)**: Implements `livekit.agents.stt.STT`, ingesting 20ms WebRTC `rtc.AudioFrame`s into the 2.5s chunk / 0.5s overlap buffer.
+- **WebRTC Audio Publisher (`LiveKitAudioPublisher`)**: Streams synthesized speech as 20ms PCM audio frames into any LiveKit Room track.
+- **Multi-Agent WebRTC Simulation (`livekit_main.py --mode dual`)**: Runs two agents exchanging WebRTC audio tracks in real time.
+- **Production Agent Worker (`livekit_main.py --mode worker`)**: Joins LiveKit rooms to handle real telephone callers via LiveKit SIP or web callers.
 
 ---
 
 ## Quick Start
 
-### 1. Run the Dual-Agent Demo (Live Audio by Default)
-
-With virtual environment active:
-```bash
-# Plays audio out loud through speakers in real time as agents converse
-python main.py --turns 4
-```
-
-### 2. CLI Options
+### 1. LiveKit Multi-Agent Demo (WebRTC Frames + Parakeet on GPU)
 
 ```bash
-# Run in silent/fast batch mode without live speaker playback
-python main.py --turns 4 --no-live
+# Run 2 agents conversing over LiveKit WebRTC audio frames using NVIDIA Parakeet
+python livekit_main.py --mode dual --asr parakeet --turns 4
 
-# Custom chunk & overlap durations
-python main.py --chunk-sec 2.5 --overlap-sec 0.5 --turns 4
-
-# Change Whisper model size (tiny, base, small, medium)
-python main.py --whisper-model small
-
-# Switch to NVIDIA Parakeet (when NeMo toolkit is installed)
-python main.py --asr parakeet
+# Or run using Faster-Whisper
+python livekit_main.py --mode dual --asr whisper --turns 4
 ```
 
----
+### 2. Standalone In-Memory Simulation
 
-## Switching to NVIDIA Parakeet
+```bash
+# Run standalone dialer demo
+python main.py --asr parakeet --turns 4
+python main.py --asr whisper --turns 4
+```
 
-To run NVIDIA Parakeet:
-1. Install NeMo ASR toolkit:
-   ```bash
-   pip install nemo_toolkit[asr]
-   ```
-2. Run with the `--asr parakeet` flag:
-   ```bash
-   python main.py --asr parakeet
-   ```
-Or set `asr_backend = "parakeet"` in [src/smartdailer/config.py](file:///c:/Users/PC/Desktop/smartdailer/src/smartdailer/config.py).
+### 3. Production LiveKit Agent Worker
+
+Configure your LiveKit credentials in `.env` (copy from `.env.example`), then run:
+
+```bash
+python livekit_main.py --mode worker --asr parakeet
+```
