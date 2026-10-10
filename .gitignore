@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Outputs and Audio
+outputs/*.wav
+*.wav
+*.mp3
+
+# Environment and IDE
+.env
+.vscode/
+.idea/
