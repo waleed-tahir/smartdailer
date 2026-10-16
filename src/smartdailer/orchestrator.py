@@ -1,12 +1,12 @@
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import numpy as np
 from rich.console import Console
 from rich.panel import Panel
 
 from smartdailer.agent import VoiceAgent
-from smartdailer.audio.utils import combine_audio_tracks, save_wav
+from smartdailer.audio.utils import combine_audio_tracks, save_wav, play_audio_array
 
 
 class DualAgentConversation:
@@ -21,12 +21,14 @@ class DualAgentConversation:
         agent_b: VoiceAgent,
         output_dir: str | Path = "outputs",
         console: Optional[Console] = None,
+        diarizer: Optional[Any] = None,
     ):
         self.agent_a = agent_a
         self.agent_b = agent_b
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.console = console or Console()
+        self.diarizer = diarizer
 
         self.history: List[Dict[str, str]] = []
         self.recorded_turns: List[tuple[str, np.ndarray]] = []
@@ -47,7 +49,7 @@ class DualAgentConversation:
                 f"[yellow]Agent A:[/yellow] {self.agent_a.name} (Voice: {self.agent_a.voice_id})\n"
                 f"[yellow]Agent B:[/yellow] {self.agent_b.name} (Voice: {self.agent_b.voice_id})\n"
                 f"[green]ASR Window:[/green] 2.5s Chunk with 0.5s Overlap (Step: 2.0s)\n"
-                f"[magenta]Live Audio Playback:[/magenta] {'Enabled (streaming to speakers)' if realtime_audio else 'Disabled'}",
+                f"[magenta]Live Audio Playback:[/magenta] {'Enabled (playing to device speakers)' if realtime_audio else 'Disabled'}",
                 border_style="cyan",
             )
         )
@@ -70,13 +72,10 @@ class DualAgentConversation:
                 f"Generated [green]{duration_sec:.2f}s[/green] audio. Playing live to speakers & streaming to [yellow]{listener.name}[/yellow]:"
             )
 
-            # 2. Start real-time audio playback through speakers
+            # 2. Play audio live through device speakers
             if realtime_audio:
-                try:
-                    import sounddevice as sd
-                    sd.play(speech_audio, samplerate=speaker.audio_config.sample_rate)
-                except Exception as e:
-                    self.console.print(f"[dim](Live playback warning: {e})[/dim]")
+                self.console.print(f"[bold cyan]▶ [Audio Playing][/bold cyan]")
+                play_audio_array(speech_audio, sample_rate=speaker.audio_config.sample_rate, wait=True)
 
             # 3. Stream chunks through listener's 2.5s window with 0.5s overlap
             def on_chunk(idx, start_s, end_s, chunk_text):
@@ -89,16 +88,8 @@ class DualAgentConversation:
             reconciled_text, chunk_details = listener.listen_and_transcribe(
                 speech_audio,
                 on_chunk_transcribed=on_chunk,
-                realtime=realtime_audio,
+                realtime=False,
             )
-
-            # Wait for audio playback to finish cleanly
-            if realtime_audio:
-                try:
-                    import sounddevice as sd
-                    sd.wait()
-                except Exception:
-                    pass
 
             self.console.print(
                 f"[bold green]Reconciled Full Transcript:[/bold green] \"{reconciled_text or current_text}\"\n"
@@ -119,23 +110,18 @@ class DualAgentConversation:
             next_text = listener.think(effective_input, self.history)
             self.console.print(f"[bold yellow]{listener.name} response:[/bold yellow] \"{next_text}\"")
 
-            # 6. Swap roles
+            # Swap roles for next turn
             current_text = next_text
             speaker, listener = listener, speaker
 
-        # 7. Save combined conversation audio file
-        master_audio = combine_audio_tracks(self.recorded_turns, pause_sec=0.6, sample_rate=16000)
-        output_wav = self.output_dir / "conversation.wav"
-        save_wav(output_wav, master_audio, sample_rate=16000)
+        # 6. Save complete dialogue audio to outputs/conversation.wav
+        master_audio = combine_audio_tracks(self.recorded_turns, pause_sec=0.5, sample_rate=self.agent_a.audio_config.sample_rate)
+        output_file = self.output_dir / "conversation.wav"
+        save_wav(output_file, master_audio, sample_rate=self.agent_a.audio_config.sample_rate)
 
+        total_duration = len(master_audio) / self.agent_a.audio_config.sample_rate
         self.console.print(
-            Panel.fit(
-                f"[bold green]Conversation Finished![/bold green]\n"
-                f"Total Turns: {len(self.recorded_turns)}\n"
-                f"Total Audio Duration: {len(master_audio)/16000:.2f} seconds\n"
-                f"Saved Master Audio: [bold cyan]{output_wav.resolve()}[/bold cyan]",
-                border_style="green",
-            )
+            f"\n[bold green]✓ Complete dialogue recorded ({total_duration:.2f}s) and saved to: {output_file}[/bold green]"
         )
 
         return self.history

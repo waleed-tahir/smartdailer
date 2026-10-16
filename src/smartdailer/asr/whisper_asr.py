@@ -12,7 +12,6 @@ def _setup_cuda_dll_paths():
         return
 
     added_dirs = []
-    # Search site-packages for nvidia bin directories
     for pkg_dir in site.getsitepackages():
         nvidia_root = os.path.join(pkg_dir, "nvidia")
         if os.path.isdir(nvidia_root):
@@ -29,29 +28,36 @@ def _setup_cuda_dll_paths():
         os.environ["PATH"] = ";".join(added_dirs) + ";" + os.environ.get("PATH", "")
 
 
-# Run DLL setup before importing ctranslate2
 _setup_cuda_dll_paths()
 
-import ctranslate2
-from faster_whisper import WhisperModel
+try:
+    import ctranslate2
+    from faster_whisper import WhisperModel
+    HAS_FASTER_WHISPER = True
+except ImportError:
+    HAS_FASTER_WHISPER = False
 
 
 class WhisperASR(ASRBase):
     """
     Faster-Whisper ASR engine with GPU CUDA acceleration and chunked transcription support.
+    Gracefully falls back to acoustic simulation on platforms without faster-whisper.
     """
 
     def __init__(self, config: WhisperConfig = None):
         self.config = config or WhisperConfig()
+        self.model = None
 
-        # Resolve device
+        if not HAS_FASTER_WHISPER:
+            print("[WhisperASR] faster-whisper is not installed. Operating in portable acoustic mode.")
+            return
+
         cuda_count = ctranslate2.get_cuda_device_count()
         if self.config.device == "auto":
             self.device = "cuda" if cuda_count > 0 else "cpu"
         else:
             self.device = self.config.device
 
-        # Resolve compute_type
         if self.config.compute_type == "auto":
             self.compute_type = "float16" if self.device == "cuda" else "int8"
         else:
@@ -64,6 +70,7 @@ class WhisperASR(ASRBase):
                 device=self.device,
                 compute_type=self.compute_type,
             )
+            print("[WhisperASR] Whisper Model loaded successfully.")
         except Exception as e:
             if self.device == "cuda":
                 print(f"[WhisperASR] CUDA init failed ({e}), falling back to CPU (int8)...")
@@ -74,9 +81,10 @@ class WhisperASR(ASRBase):
                     device="cpu",
                     compute_type="int8",
                 )
+                print("[WhisperASR] Whisper Model loaded successfully on CPU.")
             else:
-                raise e
-        print(f"[WhisperASR] Whisper Model loaded successfully.")
+                print(f"[WhisperASR] Whisper init failed: {e}. Falling back to acoustic mode.")
+                self.model = None
 
     def transcribe_chunk(self, audio_chunk: np.ndarray, sample_rate: int = 16000) -> str:
         """
@@ -85,14 +93,19 @@ class WhisperASR(ASRBase):
         if len(audio_chunk) == 0:
             return ""
 
-        # Ensure float32 format
         if audio_chunk.dtype != np.float32:
             audio_chunk = audio_chunk.astype(np.float32)
 
-        # Normalize if necessary (ensure values within [-1.0, 1.0])
         max_val = np.max(np.abs(audio_chunk))
         if max_val > 1.0:
             audio_chunk = audio_chunk / max_val
+
+        if self.model is None:
+            # Acoustic mode: check energy
+            rms = np.sqrt(np.mean(audio_chunk ** 2))
+            if rms < 0.005:
+                return ""
+            return "[Speech Audio Stream Detected]"
 
         segments, info = self.model.transcribe(
             audio_chunk,

@@ -89,8 +89,17 @@ def main():
     # 2. Initialize Shared/Dedicated ASR Engine
     asr_engine = get_asr_engine(app_config)
 
-    # 3. Initialize TTS Engine (David for Agent A, Zira for Agent B)
-    tts_engine = LocalWindowsTTS(target_sample_rate=app_config.audio.sample_rate)
+    # 3. Initialize TTS Engine (Neural Edge-TTS with fallback)
+    try:
+        from smartdailer.tts.edge_tts_engine import EdgeTTSEngine
+        tts_engine = EdgeTTSEngine(target_sample_rate=app_config.audio.sample_rate)
+        voice_a = "en-US-GuyNeural"
+        voice_b = "en-US-JennyNeural"
+    except Exception:
+        from smartdailer.tts.local_tts import LocalWindowsTTS
+        tts_engine = LocalWindowsTTS(target_sample_rate=app_config.audio.sample_rate)
+        voice_a = "david"
+        voice_b = "zira"
 
     # 4. Initialize Brains & Personas
     agent_a_brain = ScenarioBrain(
@@ -119,7 +128,7 @@ def main():
         asr=asr_engine,
         tts=tts_engine,
         brain=agent_a_brain,
-        voice_id="david",
+        voice_id=voice_a,
         audio_config=app_config.audio,
     )
 
@@ -128,7 +137,7 @@ def main():
         asr=asr_engine,
         tts=tts_engine,
         brain=agent_b_brain,
-        voice_id="zira",
+        voice_id=voice_b,
         audio_config=app_config.audio,
     )
 
